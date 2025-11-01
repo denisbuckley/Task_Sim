@@ -3,6 +3,7 @@
 # Single-run: one random triangle shared by all 9 MC triples; writes a per-run CSV and one plot per triple.
 # Batch-run: many random triangles; prints success stats and writes a compact CSV.
 
+
 import json
 import math
 import time
