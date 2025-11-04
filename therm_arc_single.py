@@ -12,12 +12,12 @@ Description:
 
 This revision adds:
   • Uniform-grid spatial index for thermals (major MC speedup)
-    - Nearest-thermal search queries a local circle from the grid.
-    - Downdraft penalty queries only cells intersecting the segment bbox.
+  • Option 3: 3D sweep/plot of probability vs speed (v_opt at MC band 1)
+    across MC band 1 and MC band 2 in adjustable steps.
 
 Behavioral notes:
-  - Still detours to the nearest thermal inside the forward sector.
-  - Option 1 plots interactively; Option 2 is headless (no figures).
+  - Detours to the nearest thermal inside the forward sector.
+  - Option 1 plots interactively; Option 2 is headless; Option 3 plots 3D surfaces.
 """
 
 from dataclasses import dataclass
@@ -28,6 +28,7 @@ import pandas as pd
 from tqdm import tqdm
 from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (needed to enable 3D)
 
 # ======================== Configuration ================================
 
@@ -73,14 +74,20 @@ MC_BAND1 = 2.0
 MC_BAND2 = 1.0
 
 # Monte Carlo
-NUM_TRIALS = 1000
+NUM_TRIALS = 1000   # used by Option 2
 
 # Plot padding when drawing field
 PLOT_PADDING_M = 20_000.0
 
 # Spatial index
 GRID_CELL_SIZE_M = OUTER_RADIUS_M   # ~600 m cells works well
-NEAREST_SEARCH_RADIUS_M = 40_000.0  # cap radius to look for nearest thermal (perf)
+NEAREST_SEARCH_RADIUS_M = 40_000.0  # cap radius to look for nearest thermal
+
+# ====== Sweep settings (Option 3) ======
+# Use STEP=0.2 by default for reasonable runtime. Set to 0.1 for finer grid.
+SWEEP_MC1_MIN, SWEEP_MC1_MAX, SWEEP_MC1_STEP = 0.0, 3.0, 0.2   # Band 1 (upper) MC
+SWEEP_MC2_MIN, SWEEP_MC2_MAX, SWEEP_MC2_STEP = 0.0, 3.0, 0.2   # Band 2 (middle) MC
+SWEEP_TRIALS_PER_CELL = 120                                    # MC draws per grid cell
 
 # ======================== Data Structures ==============================
 
@@ -114,20 +121,6 @@ def is_in_forward_arc(observer: Tuple[float, float],
     to_point  = brg_deg(observer, candidate)
     delta     = smallest_angle(to_point, to_target)
     return abs(delta) <= arc_deg / 2.0
-
-# distance from point to segment (for bbox prefilter we don't need this, but kept handy)
-def _seg_point_distance(p1: Tuple[float,float], p2: Tuple[float,float],
-                        c: Tuple[float,float]) -> float:
-    (x1,y1), (x2,y2) = p1, p2
-    (cx,cy) = c
-    dx, dy = (x2-x1, y2-y1)
-    L2 = dx*dx + dy*dy
-    if L2 == 0.0:
-        return dist(p1, c)
-    t = ((cx-x1)*dx + (cy-y1)*dy) / L2
-    t = max(0.0, min(1.0, t))
-    px, py = (x1 + t*dx, y1 + t*dy)
-    return math.hypot(cx - px, cy - py)
 
 # ======================== Glider & Bands ===============================
 
@@ -265,7 +258,6 @@ class GridIndex:
         seen = set()
         for k in self._range_keys(xmin, ymin, xmax, ymax):
             for th in self.cell.get(k, ()):
-                # cheap AABB point test
                 x, y = th.center
                 if xmin <= x <= xmax and ymin <= y <= ymax:
                     if id(th) not in seen:
@@ -273,7 +265,6 @@ class GridIndex:
                         yield th
 
     def query_circle(self, cx: float, cy: float, radius: float) -> Iterable[Thermal]:
-        # AABB cover then refine by circle
         xmin, ymin = cx - radius, cy - radius
         xmax, ymax = cx + radius, cy + radius
         r2 = radius * radius
@@ -405,7 +396,7 @@ def simulate_flight(plot: bool = False) -> Tuple[bool, float]:
         nearest_d = float("inf")
         for th in grid.query_circle(pos[0], pos[1], search_r):
             d = dist(pos, th.center)
-            if d < 1.0:  # skip degenerate/self
+            if d < 1.0:
                 continue
             if d < nearest_d and is_in_forward_arc(pos, goal, th.center, SEARCH_ARC_DEG):
                 nearest, nearest_d = th, d
@@ -453,7 +444,7 @@ def simulate_flight(plot: bool = False) -> Tuple[bool, float]:
         if not math.isfinite(z_agl) or not math.isfinite(pos[0]) or not math.isfinite(pos[1]):
             return (False, 0.0)
 
-# ======================== Monte Carlo =================================
+# ======================== Monte Carlo (Option 2) =======================
 
 def run_monte_carlo(num_trials: int = NUM_TRIALS) -> None:
     successes = 0
@@ -464,16 +455,84 @@ def run_monte_carlo(num_trials: int = NUM_TRIALS) -> None:
     p = successes / num_trials
     print(f"Trials: {num_trials} | Successes: {successes} | Probability: {p:.4f}")
 
+# ======================== Sweep & 3D Plot (Option 3) ===================
+
+def sweep_probability_surface() -> None:
+    """
+    Sweeps MC_BAND1 and MC_BAND2 on a grid, estimates probability for each pair,
+    and plots two 3D surfaces:
+      1) z = probability vs x = v_opt(MC1), y = MC2
+      2) z = probability vs x = MC1,          y = MC2
+    """
+    global MC_BAND1, MC_BAND2
+
+    mc1_vals = np.round(np.arange(SWEEP_MC1_MIN, SWEEP_MC1_MAX + 1e-9, SWEEP_MC1_STEP), 10)
+    mc2_vals = np.round(np.arange(SWEEP_MC2_MIN, SWEEP_MC2_MAX + 1e-9, SWEEP_MC2_STEP), 10)
+    X_speed = np.zeros((len(mc2_vals), len(mc1_vals)), dtype=float)  # v_opt from MC1
+    X_mc1   = np.zeros_like(X_speed)                                  # MC1 axis
+    Y_mc2   = np.zeros_like(X_speed)                                  # MC2 axis
+    Z_prob  = np.zeros_like(X_speed)                                  # probability
+
+    print(f"[SWEEP] Grid: MC1 in [{mc1_vals[0]}, {mc1_vals[-1]}] step {SWEEP_MC1_STEP}; "
+          f"MC2 in [{mc2_vals[0]}, {mc2_vals[-1]}] step {SWEEP_MC2_STEP}; "
+          f"{SWEEP_TRIALS_PER_CELL} trials/cell")
+
+    for j, mc2 in enumerate(tqdm(mc2_vals, desc="Sweep MC2 rows")):
+        for i, mc1 in enumerate(mc1_vals):
+            # set global bands for this cell
+            MC_BAND1 = float(mc1)
+            MC_BAND2 = float(mc2)
+
+            # derive "speed axis" from MC1
+            v_opt, _, _ = get_glider_parameters(MC_BAND1)
+
+            # estimate probability at this (MC1, MC2)
+            succ = 0
+            for _ in range(SWEEP_TRIALS_PER_CELL):
+                ok, _alt = simulate_flight(plot=False)
+                if ok:
+                    succ += 1
+            prob = succ / SWEEP_TRIALS_PER_CELL
+
+            X_speed[j, i] = v_opt
+            X_mc1[j, i]   = mc1
+            Y_mc2[j, i]   = mc2
+            Z_prob[j, i]  = prob
+
+    # --- Plot 1: Probability vs Speed (v_opt at MC1) and MC2 ---
+    fig = plt.figure(figsize=(10, 7))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot_surface(X_speed, Y_mc2, Z_prob, linewidth=0, antialiased=True, alpha=0.9)
+    ax.set_xlabel("Speed v_opt from MC1 (m/s)")
+    ax.set_ylabel("MC band 2 (m/s)")
+    ax.set_zlabel("Success probability")
+    ax.set_title("Probability vs Speed(MC1) and MC2")
+    plt.tight_layout()
+    plt.show()
+
+    # --- Plot 2: Probability vs MC1 and MC2 (reference surface) ---
+    fig2 = plt.figure(figsize=(10, 7))
+    ax2 = fig2.add_subplot(111, projection="3d")
+    ax2.plot_surface(X_mc1, Y_mc2, Z_prob, linewidth=0, antialiased=True, alpha=0.9)
+    ax2.set_xlabel("MC band 1 (m/s)")
+    ax2.set_ylabel("MC band 2 (m/s)")
+    ax2.set_zlabel("Success probability")
+    ax2.set_title("Probability vs MC1 and MC2")
+    plt.tight_layout()
+    plt.show()
+
 # ======================== CLI =========================================
 
 def main():
-    print("1 = single run with plot, 2 = Monte Carlo")
-    opt = input("Enter 1 or 2: ").strip()
+    print("1 = single run with plot, 2 = Monte Carlo, 3 = 3D sweep (prob vs speed & MC bands)")
+    opt = input("Enter 1, 2, or 3: ").strip()
     if opt == "1":
         ok, z = simulate_flight(plot=True)
         print("Result:", "Success" if ok else "Landout", f"(final z={z:.0f} m)")
     elif opt == "2":
         run_monte_carlo(num_trials=NUM_TRIALS)
+    elif opt == "3":
+        sweep_probability_surface()
     else:
         print("Invalid choice.")
 
