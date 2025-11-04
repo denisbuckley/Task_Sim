@@ -7,18 +7,21 @@ Transferred from Poisson repository → Task_Sim (2025-11-04)
 
 Description:
   Single-flight + Monte Carlo simulator for glider–thermal interaction.
-  Adds clustered thermal fields (Thomas, Neyman–Scott) and a downdraft
-  annulus penalty. Option 1 plots; Option 2 runs headless.
+  Supports Poisson and clustered (Thomas, Neyman–Scott) thermal fields,
+  and a downdraft annulus penalty.
 
-This revision:
-  - FIX: simulate_flight() now ALWAYS returns (bool, float) on every exit path.
-  - PERF: Downdraft penalty prefilters thermals by segment distance (cheap
-          bounding test) before exact annulus intersection → big speed-up.
-  - LOGIC: Always detour to nearest in-sector thermal (no step-cap veto).
+This revision adds:
+  • Uniform-grid spatial index for thermals (major MC speedup)
+    - Nearest-thermal search queries a local circle from the grid.
+    - Downdraft penalty queries only cells intersecting the segment bbox.
+
+Behavioral notes:
+  - Still detours to the nearest thermal inside the forward sector.
+  - Option 1 plots interactively; Option 2 is headless (no figures).
 """
 
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Iterable
 import math, random
 import numpy as np
 import pandas as pd
@@ -75,6 +78,10 @@ NUM_TRIALS = 1000
 # Plot padding when drawing field
 PLOT_PADDING_M = 20_000.0
 
+# Spatial index
+GRID_CELL_SIZE_M = OUTER_RADIUS_M   # ~600 m cells works well
+NEAREST_SEARCH_RADIUS_M = 40_000.0  # cap radius to look for nearest thermal (perf)
+
 # ======================== Data Structures ==============================
 
 @dataclass
@@ -108,7 +115,7 @@ def is_in_forward_arc(observer: Tuple[float, float],
     delta     = smallest_angle(to_point, to_target)
     return abs(delta) <= arc_deg / 2.0
 
-# ------ distance from point to segment (for prefilter) ------
+# distance from point to segment (for bbox prefilter we don't need this, but kept handy)
 def _seg_point_distance(p1: Tuple[float,float], p2: Tuple[float,float],
                         c: Tuple[float,float]) -> float:
     (x1,y1), (x2,y2) = p1, p2
@@ -221,6 +228,65 @@ def generate_clustered_neyman(sim_side_m: float,
             out.append(Thermal(center=(cx, cy), updraft_radius=r, strength_ms=s))
     return out
 
+# ======================== Spatial Index (Uniform Grid) =================
+
+class GridIndex:
+    """Uniform grid spatial index for thermals."""
+    __slots__ = ("cell", "cell_size")
+
+    def __init__(self, cell_size: float):
+        self.cell_size = float(cell_size)
+        self.cell: Dict[Tuple[int,int], List[Thermal]] = {}
+
+    def _key(self, x: float, y: float) -> Tuple[int,int]:
+        cs = self.cell_size
+        return (int(math.floor(x / cs)), int(math.floor(y / cs)))
+
+    def insert(self, th: Thermal) -> None:
+        k = self._key(th.center[0], th.center[1])
+        self.cell.setdefault(k, []).append(th)
+
+    @classmethod
+    def build(cls, thermals: List[Thermal], cell_size: float) -> "GridIndex":
+        gi = cls(cell_size)
+        for th in thermals:
+            gi.insert(th)
+        return gi
+
+    def _range_keys(self, xmin: float, ymin: float, xmax: float, ymax: float) -> Iterable[Tuple[int,int]]:
+        cs = self.cell_size
+        ix0, iy0 = int(math.floor(xmin / cs)), int(math.floor(ymin / cs))
+        ix1, iy1 = int(math.floor(xmax / cs)), int(math.floor(ymax / cs))
+        for ix in range(ix0, ix1 + 1):
+            for iy in range(iy0, iy1 + 1):
+                yield (ix, iy)
+
+    def query_bbox(self, xmin: float, ymin: float, xmax: float, ymax: float) -> Iterable[Thermal]:
+        seen = set()
+        for k in self._range_keys(xmin, ymin, xmax, ymax):
+            for th in self.cell.get(k, ()):
+                # cheap AABB point test
+                x, y = th.center
+                if xmin <= x <= xmax and ymin <= y <= ymax:
+                    if id(th) not in seen:
+                        seen.add(id(th))
+                        yield th
+
+    def query_circle(self, cx: float, cy: float, radius: float) -> Iterable[Thermal]:
+        # AABB cover then refine by circle
+        xmin, ymin = cx - radius, cy - radius
+        xmax, ymax = cx + radius, cy + radius
+        r2 = radius * radius
+        seen = set()
+        for k in self._range_keys(xmin, ymin, xmax, ymax):
+            for th in self.cell.get(k, ()):
+                if id(th) in seen:
+                    continue
+                dx, dy = th.center[0] - cx, th.center[1] - cy
+                if dx*dx + dy*dy <= r2:
+                    seen.add(id(th))
+                    yield th
+
 # ======================== Segment / Annulus ============================
 
 def _roots_for_radius(center: Tuple[float,float], R: float,
@@ -266,7 +332,7 @@ def length_inside_annulus(center: Tuple[float,float],
 def simulate_flight(plot: bool = False) -> Tuple[bool, float]:
     """Return (success, final_altitude_m)."""
     origin = (0.0, 0.0)
-    goal   = (0.0, TASK_DISTANCE)  # fly straight “north”
+    goal   = (0.0, TASK_DISTANCE)  # straight “north”
     z_agl  = CBL_ALT
 
     # sim square covering origin+goal+padding
@@ -287,6 +353,9 @@ def simulate_flight(plot: bool = False) -> Tuple[bool, float]:
             thermals = generate_clustered_neyman(sim_side_m, lam_parent, MEAN_CHILDREN, NEYMAN_RADIUS_M, LAMBDA_STRENGTH)
         else:
             raise ValueError(f"Unknown THERMAL_FIELD_MODEL='{THERMAL_FIELD_MODEL}'")
+
+    # Build grid index
+    grid = GridIndex.build(thermals, GRID_CELL_SIZE_M)
 
     # Plot
     if plot:
@@ -309,7 +378,6 @@ def simulate_flight(plot: bool = False) -> Tuple[bool, float]:
     while True:
         safety_iter += 1
         if safety_iter > 20_000:
-            # hard stop to avoid any unexpected stalls
             return (False, z_agl)
 
         d_to_goal = dist(pos, goal)
@@ -331,14 +399,15 @@ def simulate_flight(plot: bool = False) -> Tuple[bool, float]:
         # Bearing to goal
         brg_to_goal = brg_deg(pos, goal)
 
-        # ----- nearest thermal in forward sector (always detour if present) -----
+        # ----- nearest thermal in forward sector via grid circle query -----
+        search_r = min(NEAREST_SEARCH_RADIUS_M, d_to_goal + 1.0)
         nearest = None
         nearest_d = float("inf")
-        for th in thermals:
+        for th in grid.query_circle(pos[0], pos[1], search_r):
             d = dist(pos, th.center)
             if d < 1.0:  # skip degenerate/self
                 continue
-            if is_in_forward_arc(pos, goal, th.center, SEARCH_ARC_DEG) and d < nearest_d:
+            if d < nearest_d and is_in_forward_arc(pos, goal, th.center, SEARCH_ARC_DEG):
                 nearest, nearest_d = th, d
 
         if nearest is not None:
@@ -351,12 +420,14 @@ def simulate_flight(plot: bool = False) -> Tuple[bool, float]:
         if seg_len < 0.1:
             return (False, z_agl)
 
-        # --------- Downdraft penalty (prefilter by segment distance) ----------
+        # --------- Downdraft penalty via grid bbox prefilter ----------
+        xmin = min(pos[0], next_pt[0]) - OUTER_RADIUS_M
+        xmax = max(pos[0], next_pt[0]) + OUTER_RADIUS_M
+        ymin = min(pos[1], next_pt[1]) - OUTER_RADIUS_M
+        ymax = max(pos[1], next_pt[1]) + OUTER_RADIUS_M
+
         length_in_dd = 0.0
-        for th in thermals:
-            # quick reject: if center-to-segment distance > outer radius → skip
-            if _seg_point_distance(pos, next_pt, th.center) > OUTER_RADIUS_M:
-                continue
+        for th in grid.query_bbox(xmin, ymin, xmax, ymax):
             r_in = th.updraft_radius; r_out = OUTER_RADIUS_M
             if r_out > r_in:
                 length_in_dd += length_inside_annulus(th.center, r_in, r_out, pos, next_pt)
