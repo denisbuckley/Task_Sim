@@ -8,16 +8,16 @@ Transferred from Poisson repository → Task_Sim (2025-11-04)
 Description:
   Single-flight + Monte Carlo simulator for glider–thermal interaction.
   Supports Poisson and clustered (Thomas, Neyman–Scott) thermal fields,
-  and a downdraft annulus penalty.
+  with a downdraft annulus penalty and a uniform-grid spatial index.
 
-This revision adds:
-  • Uniform-grid spatial index for thermals (major MC speedup)
-  • Option 3: 3D sweep/plot of probability vs speed (v_opt at MC band 1)
-    across MC band 1 and MC band 2 in adjustable steps.
+Options:
+  1) Single run with plot
+  2) Monte Carlo probability for current params (headless)
+  3) 3D probability surfaces vs speed(MC1) and MC bands
+  4) 2D probability curves: x=MC band 1 (0.1 steps), multiple curves for MC band 2 (1.0 steps)
 
-Behavioral notes:
-  - Detours to the nearest thermal inside the forward sector.
-  - Option 1 plots interactively; Option 2 is headless; Option 3 plots 3D surfaces.
+This revision:
+  • Adds Option 4: 2D probability plot with MC1 on x-axis and separate curves for MC2.
 """
 
 from dataclasses import dataclass
@@ -28,7 +28,6 @@ import pandas as pd
 from tqdm import tqdm
 from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (needed to enable 3D)
 
 # ======================== Configuration ================================
 
@@ -84,10 +83,14 @@ GRID_CELL_SIZE_M = OUTER_RADIUS_M   # ~600 m cells works well
 NEAREST_SEARCH_RADIUS_M = 40_000.0  # cap radius to look for nearest thermal
 
 # ====== Sweep settings (Option 3) ======
-# Use STEP=0.2 by default for reasonable runtime. Set to 0.1 for finer grid.
-SWEEP_MC1_MIN, SWEEP_MC1_MAX, SWEEP_MC1_STEP = 0.0, 3.0, 0.2   # Band 1 (upper) MC
-SWEEP_MC2_MIN, SWEEP_MC2_MAX, SWEEP_MC2_STEP = 0.0, 3.0, 0.2   # Band 2 (middle) MC
-SWEEP_TRIALS_PER_CELL = 120                                    # MC draws per grid cell
+SWEEP_MC1_MIN, SWEEP_MC1_MAX, SWEEP_MC1_STEP = 0.0, 3.0, 0.2
+SWEEP_MC2_MIN, SWEEP_MC2_MAX, SWEEP_MC2_STEP = 0.0, 3.0, 0.2
+SWEEP_TRIALS_PER_CELL = 120
+
+# ====== 2D plot settings (Option 4) ======
+PLOT2D_MC1_MIN, PLOT2D_MC1_MAX, PLOT2D_MC1_STEP = 0.0, 3.0, 0.1      # band 1 stepping
+PLOT2D_MC2_VALUES = [0.0, 1.0, 2.0, 3.0]                              # band 2 curves
+PLOT2D_TRIALS_PER_POINT = 120                                         # MC draws per x point
 
 # ======================== Data Structures ==============================
 
@@ -458,74 +461,80 @@ def run_monte_carlo(num_trials: int = NUM_TRIALS) -> None:
 # ======================== Sweep & 3D Plot (Option 3) ===================
 
 def sweep_probability_surface() -> None:
-    """
-    Sweeps MC_BAND1 and MC_BAND2 on a grid, estimates probability for each pair,
-    and plots two 3D surfaces:
-      1) z = probability vs x = v_opt(MC1), y = MC2
-      2) z = probability vs x = MC1,          y = MC2
-    """
     global MC_BAND1, MC_BAND2
-
     mc1_vals = np.round(np.arange(SWEEP_MC1_MIN, SWEEP_MC1_MAX + 1e-9, SWEEP_MC1_STEP), 10)
     mc2_vals = np.round(np.arange(SWEEP_MC2_MIN, SWEEP_MC2_MAX + 1e-9, SWEEP_MC2_STEP), 10)
-    X_speed = np.zeros((len(mc2_vals), len(mc1_vals)), dtype=float)  # v_opt from MC1
-    X_mc1   = np.zeros_like(X_speed)                                  # MC1 axis
-    Y_mc2   = np.zeros_like(X_speed)                                  # MC2 axis
-    Z_prob  = np.zeros_like(X_speed)                                  # probability
-
-    print(f"[SWEEP] Grid: MC1 in [{mc1_vals[0]}, {mc1_vals[-1]}] step {SWEEP_MC1_STEP}; "
-          f"MC2 in [{mc2_vals[0]}, {mc2_vals[-1]}] step {SWEEP_MC2_STEP}; "
-          f"{SWEEP_TRIALS_PER_CELL} trials/cell")
+    X_speed = np.zeros((len(mc2_vals), len(mc1_vals)), dtype=float)
+    X_mc1   = np.zeros_like(X_speed)
+    Y_mc2   = np.zeros_like(X_speed)
+    Z_prob  = np.zeros_like(X_speed)
 
     for j, mc2 in enumerate(tqdm(mc2_vals, desc="Sweep MC2 rows")):
         for i, mc1 in enumerate(mc1_vals):
-            # set global bands for this cell
-            MC_BAND1 = float(mc1)
-            MC_BAND2 = float(mc2)
-
-            # derive "speed axis" from MC1
+            MC_BAND1 = float(mc1); MC_BAND2 = float(mc2)
             v_opt, _, _ = get_glider_parameters(MC_BAND1)
-
-            # estimate probability at this (MC1, MC2)
             succ = 0
             for _ in range(SWEEP_TRIALS_PER_CELL):
                 ok, _alt = simulate_flight(plot=False)
-                if ok:
-                    succ += 1
+                succ += int(ok)
             prob = succ / SWEEP_TRIALS_PER_CELL
+            X_speed[j, i] = v_opt; X_mc1[j, i] = mc1; Y_mc2[j, i] = mc2; Z_prob[j, i] = prob
 
-            X_speed[j, i] = v_opt
-            X_mc1[j, i]   = mc1
-            Y_mc2[j, i]   = mc2
-            Z_prob[j, i]  = prob
-
-    # --- Plot 1: Probability vs Speed (v_opt at MC1) and MC2 ---
     fig = plt.figure(figsize=(10, 7))
     ax = fig.add_subplot(111, projection="3d")
     ax.plot_surface(X_speed, Y_mc2, Z_prob, linewidth=0, antialiased=True, alpha=0.9)
-    ax.set_xlabel("Speed v_opt from MC1 (m/s)")
-    ax.set_ylabel("MC band 2 (m/s)")
-    ax.set_zlabel("Success probability")
+    ax.set_xlabel("Speed v_opt from MC1 (m/s)"); ax.set_ylabel("MC band 2 (m/s)"); ax.set_zlabel("Probability")
     ax.set_title("Probability vs Speed(MC1) and MC2")
-    plt.tight_layout()
-    plt.show()
+    plt.tight_layout(); plt.show()
 
-    # --- Plot 2: Probability vs MC1 and MC2 (reference surface) ---
     fig2 = plt.figure(figsize=(10, 7))
     ax2 = fig2.add_subplot(111, projection="3d")
     ax2.plot_surface(X_mc1, Y_mc2, Z_prob, linewidth=0, antialiased=True, alpha=0.9)
-    ax2.set_xlabel("MC band 1 (m/s)")
-    ax2.set_ylabel("MC band 2 (m/s)")
-    ax2.set_zlabel("Success probability")
+    ax2.set_xlabel("MC band 1 (m/s)"); ax2.set_ylabel("MC band 2 (m/s)"); ax2.set_zlabel("Probability")
     ax2.set_title("Probability vs MC1 and MC2")
+    plt.tight_layout(); plt.show()
+
+# ======================== 2D Plot (Option 4) ===========================
+
+def sweep_2d_curves() -> None:
+    """
+    2D plot of success probability vs MC band 1.
+    - x-axis: MC band 1 in 0.1 steps (PLOT2D_MC1_STEP)
+    - separate curves for MC band 2 values (PLOT2D_MC2_VALUES, 1.0 increments by default)
+    """
+    global MC_BAND1, MC_BAND2
+
+    mc1_vals = np.round(np.arange(PLOT2D_MC1_MIN, PLOT2D_MC1_MAX + 1e-9, PLOT2D_MC1_STEP), 10)
+
+    plt.figure(figsize=(9, 6))
+    for mc2 in PLOT2D_MC2_VALUES:
+        probs = []
+        MC_BAND2 = float(mc2)
+        for mc1 in tqdm(mc1_vals, desc=f"Curves MC2={mc2:.1f}"):
+            MC_BAND1 = float(mc1)
+            succ = 0
+            for _ in range(PLOT2D_TRIALS_PER_POINT):
+                ok, _alt = simulate_flight(plot=False)
+                succ += int(ok)
+            probs.append(succ / PLOT2D_TRIALS_PER_POINT)
+        plt.plot(mc1_vals, probs, marker="", linewidth=2, label=f"MC2 = {mc2:.1f}")
+
+    plt.xlabel("MC band 1 (m/s)")
+    plt.ylabel("Success probability")
+    plt.title("Probability vs MC1 with MC2 curves")
+    plt.grid(True, alpha=0.3)
+    plt.legend(title="Band 2")
     plt.tight_layout()
     plt.show()
 
 # ======================== CLI =========================================
 
 def main():
-    print("1 = single run with plot, 2 = Monte Carlo, 3 = 3D sweep (prob vs speed & MC bands)")
-    opt = input("Enter 1, 2, or 3: ").strip()
+    print("1 = single run with plot")
+    print("2 = Monte Carlo (current params)")
+    print("3 = 3D sweep (prob vs speed & MC bands)")
+    print("4 = 2D curves (prob vs MC1; separate curves for MC2)")
+    opt = input("Enter 1, 2, 3, or 4: ").strip()
     if opt == "1":
         ok, z = simulate_flight(plot=True)
         print("Result:", "Success" if ok else "Landout", f"(final z={z:.0f} m)")
@@ -533,6 +542,8 @@ def main():
         run_monte_carlo(num_trials=NUM_TRIALS)
     elif opt == "3":
         sweep_probability_surface()
+    elif opt == "4":
+        sweep_2d_curves()
     else:
         print("Invalid choice.")
 
