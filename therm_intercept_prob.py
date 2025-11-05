@@ -265,6 +265,18 @@ def main():
     ap.add_argument("--seed", type=int, default=None, help="Optional RNG seed (omit for true MC)")
     ap.add_argument("--no-analytic-overlay", action="store_true",
                     help="Disable the analytic overlay (enabled by default)")
+    import sys
+    # --- Default preset for IDE run (if no CLI args) ---
+    if len(sys.argv) == 1:  # i.e. just "python therm_intercept_prob.py"
+        sys.argv.extend([
+            "--cap-km", "0",
+            "--lambda-a", "0.02",
+            "--p-up", "0.6",
+            "--radius-mode", "fixed",
+            "--radius-m", "300",
+            "--trials", "1000"
+        ])
+        print("[INFO] Using default preset parameters for IDE run")
     args = ap.parse_args()
     # Show analytic overlay by default unless explicitly disabled
     show_overlay = not args.no_analytic_overlay
