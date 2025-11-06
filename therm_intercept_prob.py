@@ -39,7 +39,7 @@ SPEED_MIN_KMH = 100
 SPEED_MAX_KMH = 250
 TRIALS_DEFAULT = 1000
 
-LAMBDA_A_DEFAULT = 0.02       # thermals / km^2 (areal density)  (tuned for "active-ish" day)
+LAMBDA_A_DEFAULT = 0.0145       # thermals / km^2 (areal density)  (tuned for "active-ish" day)
 P_UP_DEFAULT = 0.60           # fraction of thermals that are updrafts
 
 # Polar: simple convex quadratic around min-sink point (approx LS10-ish)
@@ -266,11 +266,14 @@ def main():
             sniff_k  = _ask("Sniff k (meters per (Wt-MC)^3)", float, SNIFF_K_DEFAULT)
             radius_m = RADIUS_M_DEFAULT  # unused in sniff
         h0_m    = _ask("Start altitude H0 (m)", float, H0_M_DEFAULT)
-        hmin_m  = _ask("Minimum altitude Hmin (m)", float, HMIN_M_DEFAULT)
+        #hmin_m  = _ask("Minimum altitude Hmin (m)", float, HMIN_M_DEFAULT)
+        hmin_m = HMIN_M_DEFAULT
         cap_km  = _ask("Cap length (km; 0=off)", float, CAP_KM_DEFAULT)
         csv_out = input(f"CSV output path [{OUT_CSV_DEFAULT}]: ").strip() or OUT_CSV_DEFAULT
-        seed    = _ask("RNG seed (int; blank=none)", int, None) if _maybe_yes("Set a fixed RNG seed?", False) else None
-        show_overlay = _maybe_yes("Show analytic overlay?", True)
+        # seed    = _ask("RNG seed (int; blank=none)", int, None) if _maybe_yes("Set a fixed RNG seed?", False) else None
+        seed = None
+        #show_overlay = _maybe_yes("Show analytic overlay?", True)
+        show_overlay = True
 
         # Inject as if they were CLI args
         sys.argv.extend([
